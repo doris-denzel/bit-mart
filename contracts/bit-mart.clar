@@ -250,3 +250,130 @@
     }))
   )
 )
+
+;; Submit auction bid
+(define-public (submit-bid (product-id uint) (bid-amount uint))
+  (let
+    ((product-info (unwrap! (map-get? products product-id) ERR_PRODUCT_NOT_FOUND))
+     (auction-info (unwrap! (map-get? auctions product-id) ERR_INVALID_AUCTION)))
+    
+    ;; Validate bid conditions
+    (asserts! (get is-live auction-info) ERR_AUCTION_EXPIRED)
+    (asserts! (< stacks-block-height (get expiry-block auction-info)) ERR_AUCTION_EXPIRED)
+    (asserts! (>= bid-amount (get reserve-price auction-info)) ERR_BID_TOO_LOW)
+    (asserts! (> bid-amount (get top-bid auction-info)) ERR_BID_TOO_LOW)
+    (asserts! (>= (stx-get-balance tx-sender) bid-amount) ERR_INSUFFICIENT_BALANCE)
+    
+    ;; Refund previous bidder
+    (match (get leading-bidder auction-info)
+      previous-bidder (try! (stx-transfer? (get top-bid auction-info) CONTRACT_OWNER previous-bidder))
+      true)
+    
+    ;; Accept new bid
+    (try! (stx-transfer? bid-amount tx-sender CONTRACT_OWNER))
+    
+    ;; Update auction state
+    (ok (map-set auctions product-id
+      (merge auction-info {
+        top-bid: bid-amount,
+        leading-bidder: (some tx-sender)
+      })))
+  )
+)
+
+;; Finalize completed auction
+(define-public (finalize-auction (product-id uint))
+  (let
+    ((product-info (unwrap! (map-get? products product-id) ERR_PRODUCT_NOT_FOUND))
+     (auction-info (unwrap! (map-get? auctions product-id) ERR_INVALID_AUCTION))
+     (merchant (get merchant product-info)))
+    
+    ;; Validate auction completion
+    (asserts! (get is-live auction-info) ERR_AUCTION_EXPIRED)
+    (asserts! (>= stacks-block-height (get expiry-block auction-info)) ERR_AUCTION_EXPIRED)
+    
+    ;; Process winning bid
+    (match (get leading-bidder auction-info)
+      winner (let ((final-bid (get top-bid auction-info))
+                   (platform-fee (/ (* final-bid (var-get platform-fee-bps)) u10000)))
+        ;; Distribute payment
+        (try! (stx-transfer? platform-fee CONTRACT_OWNER CONTRACT_OWNER))
+        (try! (stx-transfer? (- final-bid platform-fee) CONTRACT_OWNER merchant))
+        
+        ;; Close auction
+        (map-set products product-id 
+          (merge product-info {is-available: false}))
+        (ok (map-set auctions product-id
+          (merge auction-info {is-live: false}))))
+      
+      ERR_INVALID_AUCTION)
+  )
+)
+
+;; REVIEW SYSTEM
+
+;; Submit product review
+(define-public (submit-review 
+    (product-id uint)
+    (rating uint)
+    (review-comment (string-ascii 256)))
+  (let
+    ((product-info (unwrap! (map-get? products product-id) ERR_PRODUCT_NOT_FOUND)))
+    
+    ;; Validate review parameters
+    (asserts! (and (>= rating u1) (<= rating u5)) ERR_INVALID_RATING)
+    (asserts! (and (>= (len review-comment) u1) (<= (len review-comment) u256)) ERR_INVALID_INPUT)
+    
+    ;; Store review
+    (ok (map-set reviews 
+      {product-id: product-id, customer: tx-sender}
+      {
+        star-rating: rating,
+        review-text: review-comment,
+        review-block: stacks-block-height
+      }))
+  )
+)
+
+;; READ-ONLY FUNCTIONS
+
+;; Get product information
+(define-read-only (get-product-info (product-id uint))
+  (map-get? products product-id)
+)
+
+;; Get brand information
+(define-read-only (get-brand-info (merchant principal))
+  (map-get? brands merchant)
+)
+
+;; Get auction details
+(define-read-only (get-auction-info (product-id uint))
+  (map-get? auctions product-id)
+)
+
+;; Get customer review
+(define-read-only (get-product-review (product-id uint) (customer principal))
+  (map-get? reviews {product-id: product-id, customer: customer})
+)
+
+;; Get current platform fee
+(define-read-only (get-platform-fee)
+  (var-get platform-fee-bps)
+)
+
+;; Get total products listed
+(define-read-only (get-product-count)
+  (var-get product-counter)
+)
+
+;; ADMIN FUNCTIONS
+
+;; Update platform fee (owner only)
+(define-public (update-platform-fee (new-fee-bps uint))
+  (begin
+    (asserts! (is-eq tx-sender CONTRACT_OWNER) ERR_UNAUTHORIZED)
+    (asserts! (<= new-fee-bps u1000) ERR_INVALID_INPUT)  ;; Max 10%
+    (ok (var-set platform-fee-bps new-fee-bps))
+  )
+)
